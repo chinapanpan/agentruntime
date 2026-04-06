@@ -23,15 +23,16 @@ spec.template 变更 → SHA256(template) → status.revision 更新
 | **空闲 (Available)** | 自动删除旧 revision Pod，创建新 revision Pod |
 | **已分配 (Allocated)** | **不受影响** — 被 BatchSandbox 保护，直到释放 |
 
-### Kata-CLH 限制
+### Kata-CLH / Firecracker 限制
 
-- **无 live migration**: microVM 不支持在线迁移，镜像变更必须重建 Pod（新 microVM）
-- **重建 = 会话丢失**: 已分配 Pod 被删除意味着用户会话终止
+- **无 live migration**: 所有 Kata VMM (CLH / QEMU / Firecracker) 都不支持在线迁移
+- **Firecracker snapshot/restore 不能换镜像**: restore 恢复的是同版本 VM，无法用于镜像升级
+- **重建 = 新 microVM**: 镜像变更必须重建 Pod，进程状态丢失
 - **回填时间**: 新 Pod 冷启动约 2.8-3.4s
 
 ### 关键结论
 
-> 空闲 Pod 可无缝升级（内置机制），已分配 Pod 需要 **业务层配合** 才能安全升级。
+> 空闲 Pod 可无缝升级（内置机制）。已分配 Pod 无法 VM 级热更新，但可以通过 **状态外置 + 任务边界切换** 实现接近零中断的升级。
 
 ---
 
@@ -444,25 +445,245 @@ EOF
 
 ---
 
-## 6. 策略对比与推荐
+## 6. Strategy 4: 最小中断升级（状态外置 + 任务边界切换）
 
-| | Strategy 1: 滚动更新 | Strategy 2: Blue-Green | Strategy 3: 优雅排空 |
-|--|---------------------|----------------------|-------------------|
-| **范围** | 仅空闲 Pod | 全量 (新 Pool) | 已分配 Pod |
-| **服务中断** | 无 | 无 | 每个 sandbox 短暂中断 |
-| **升级期间新 Claim** | 正常 (~200ms) | 正常 (~200ms) | 正常 |
-| **资源开销** | 1x Pool | 2x Pool (过渡期) | 1x Pool |
-| **复杂度** | 低 (一条 patch) | 中 (双 Pool 管理) | 高 (逐个排空) |
-| **回滚速度** | 快 (re-patch) | 快 (切回旧 Pool) | 手动逐个 |
-| **适合场景** | 常规更新 | 生产关键升级 | 强制全量升级 |
+**适用场景**: 需要升级运行中 Sandbox 且不能丢失用户会话状态。
+
+**核心思路**: VM 级热更新不可能，但可以在 **应用层** 实现近零中断 — 将会话状态持久化到共享存储，在任务间隙切换到新 Sandbox。
+
+### 架构
+
+```
+┌─────────────────────────────────────────────────┐
+│  AI Agent Service                               │
+│  ┌───────────────────────────────┐              │
+│  │ Session Manager               │              │
+│  │  - 追踪每个 session 的状态    │              │
+│  │  - 在任务边界触发迁移         │              │
+│  └──────────┬────────────────────┘              │
+│             │                                    │
+│  ┌──────────▼──────────┐  ┌───────────────────┐ │
+│  │ 旧 Sandbox (v1)     │  │ 新 Sandbox (v2)   │ │
+│  │ ┌────────────────┐  │  │ ┌───────────────┐ │ │
+│  │ │ [Task3] 执行中 │  │  │ │ [Task4] 待接收│ │ │
+│  │ └────────────────┘  │  │ └───────────────┘ │ │
+│  │     │               │  │     ▲             │ │
+│  │     ▼ 写入状态      │  │     │ 恢复状态    │ │
+│  └─────┼───────────────┘  └─────┼─────────────┘ │
+│        │                        │                │
+│  ┌─────▼────────────────────────┼──────────┐     │
+│  │     Shared PVC (EFS/EBS)                │     │
+│  │     /data/session-state.json            │     │
+│  │     /data/workspace/                    │     │
+│  └─────────────────────────────────────────┘     │
+└──────────────────────────────────────────────────┘
+```
+
+**中断时间**: 仅在任务边界切换，用户感知 **0 中断**（当前任务完成后无缝衔接）。
+
+### 方案 A: 共享 PVC + 任务边界切换
+
+最实用的方案。利用 EFS（NFS）作为共享存储，新旧 Sandbox 都挂载同一 PVC。
+
+**Step 1: 创建共享 EFS 存储 (一次性)**
+
+```bash
+# 创建 EFS StorageClass (如果尚未创建)
+cat <<'EOF' | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: <YOUR_EFS_ID>
+  directoryPerms: "700"
+EOF
+
+# 创建 PVC
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sandbox-shared-state
+  namespace: opensandbox-system
+spec:
+  accessModes:
+    - ReadWriteMany        # EFS 支持多 Pod 同时读写
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 10Gi
+EOF
+```
+
+**Step 2: Pool 模板中挂载共享 PVC**
+
+```bash
+cat <<'EOF' | kubectl apply -f -
+apiVersion: sandbox.opensandbox.io/v1alpha1
+kind: Pool
+metadata:
+  name: kata-clh-pool
+  namespace: opensandbox-system
+spec:
+  template:
+    spec:
+      runtimeClassName: kata-clh
+      containers:
+      - name: sandbox
+        image: busybox:1.37          # 新镜像
+        command: ["sh", "-c", "while true; do sleep 3600; done"]
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        volumeMounts:
+        - name: shared-state
+          mountPath: /data
+      volumes:
+      - name: shared-state
+        persistentVolumeClaim:
+          claimName: sandbox-shared-state
+  capacitySpec:
+    bufferMin: 5
+    bufferMax: 10
+    poolMin: 5
+    poolMax: 50
+EOF
+```
+
+**Step 3: AI Agent 侧 — 任务边界迁移逻辑**
+
+```python
+# AI Agent Service 伪代码
+import json, os
+
+class SandboxSession:
+    def __init__(self, session_id, sandbox_client):
+        self.session_id = session_id
+        self.sandbox = sandbox_client
+        self.state_path = f"/data/sessions/{session_id}/state.json"
+
+    def save_state(self):
+        """将会话状态写入共享存储"""
+        state = {
+            "session_id": self.session_id,
+            "env_vars": self.get_env_vars(),
+            "working_dir": self.get_cwd(),
+            "history": self.get_command_history(),
+        }
+        self.sandbox.exec(f"mkdir -p /data/sessions/{self.session_id}")
+        self.sandbox.exec(
+            f"cat > {self.state_path} << 'STATEEOF'\n"
+            f"{json.dumps(state)}\n"
+            f"STATEEOF"
+        )
+
+    def restore_state(self):
+        """从共享存储恢复会话状态"""
+        raw = self.sandbox.exec(f"cat {self.state_path}")
+        state = json.loads(raw)
+        for k, v in state["env_vars"].items():
+            self.sandbox.exec(f"export {k}={v}")
+        self.sandbox.exec(f"cd {state['working_dir']}")
+
+    def migrate_to_new_sandbox(self, new_sandbox):
+        """任务完成后，迁移到新 Sandbox"""
+        # 1. 保存当前状态
+        self.save_state()
+
+        # 2. 切换到新 Sandbox (新镜像, 同 PVC)
+        self.sandbox = new_sandbox
+
+        # 3. 恢复状态
+        self.restore_state()
+
+        # 4. 继续接收新任务
+        print(f"Session {self.session_id} migrated to new sandbox")
+```
+
+**Step 4: 执行升级流程**
+
+```bash
+# 1. 用 Strategy 2 (Blue-Green) 创建新 Pool
+export NEW_POOL=kata-clh-pool-v2
+# ... (同 Strategy 2 Step 1-3)
+
+# 2. 对每个活跃 session，在当前任务完成后:
+#    a) 从新 Pool claim 新 Sandbox
+#    b) 新 Sandbox 自动挂载相同 PVC
+#    c) Agent 调用 restore_state() 恢复会话
+#    d) 删除旧 BatchSandbox
+
+# 3. 旧 Pool 自然排空后删除
+```
+
+### 方案 B: Ingress 路由切换
+
+利用 OpenSandbox Ingress Gateway 的路由能力，在代理层切换后端 Sandbox。
+
+```
+Client → Ingress Gateway → [sandbox-id 路由] → 新 Sandbox Pod
+                                              ↗ (路由更新)
+                           [sandbox-id 路由] → 旧 Sandbox Pod (断开)
+```
+
+**原理**: OpenSandbox Ingress 支持 header-based 和 URI-based 路由:
+- Header: `OpenSandbox-Ingress-To: <sandbox-id>-<port>`
+- URI: `/<sandbox-id>/<sandbox-port>/<path>`
+
+当新 Sandbox 就绪后，更新路由指向新 Pod，客户端下次请求自动到新 Sandbox。
+
+```bash
+# 迁移步骤:
+# 1. 创建新 BatchSandbox (新 Pool)
+# 2. 获取新 Pod 的 sandbox-id
+# 3. 更新 Ingress 路由映射 (session → new sandbox-id)
+# 4. 客户端下次请求自动路由到新 Sandbox
+# 5. 删除旧 BatchSandbox
+```
+
+**中断**: WebSocket 连接会断开需重连，HTTP 请求无感知切换。
+
+### 方案 C: OSEP-0008 Pause/Resume (未来)
+
+OpenSandbox 正在实现 **rootfs snapshot** 机制 (OSEP-0008):
+
+```
+Pause:  运行中 Sandbox → commit rootfs → 推送到 OCI Registry → 释放资源
+Resume: 从 snapshot 镜像 → 创建新 Sandbox → 文件系统完整恢复
+```
+
+- **保留**: 文件系统状态（安装的包、生成的文件、配置变更）
+- **不保留**: 进程状态、内存、网络连接
+- **优势**: 不需要额外的 PVC，rootfs 本身就是状态载体
+- **状态**: 开发中 (Phase 1: PV 持久化, Phase 2: rootfs snapshot, Phase 3: 进程 checkpoint)
+
+---
+
+## 7. 策略对比与推荐
+
+| | S1: 滚动更新 | S2: Blue-Green | S3: 优雅排空 | S4: 状态外置+任务边界 |
+|--|-------------|---------------|-------------|-------------------|
+| **范围** | 仅空闲 Pod | 全量 (新 Pool) | 已分配 Pod | 已分配 Pod |
+| **会话状态** | 不影响 | 不影响 | 丢失 | **保留** ✅ |
+| **用户感知中断** | 无 | 无 | 短暂中断 | **零中断** ✅ |
+| **升级期间新 Claim** | 正常 | 正常 | 正常 | 正常 |
+| **资源开销** | 1x Pool | 2x Pool | 1x Pool | 2x Pool + PVC |
+| **复杂度** | 低 | 中 | 高 | 高 (需改 Agent) |
+| **回滚速度** | 快 | 快 | 手动 | 快 (切回旧 Pool) |
+| **前提条件** | 无 | 无 | 无 | 共享 PVC (EFS) |
 
 ### 推荐组合
 
 | 场景 | 推荐方案 |
 |------|---------|
-| **日常镜像更新** (安全补丁等) | Strategy 1 — 旧 sandbox 自然释放后逐步切换 |
-| **生产重大升级** (API 变更等) | Strategy 2 + Strategy 3 — Blue-Green 切换后排空旧 sandbox |
-| **紧急安全修复** | Strategy 1 + Strategy 3 — 滚动更新空闲 Pod + 立即排空已分配 sandbox |
+| **日常镜像更新** (安全补丁等) | S1 — 旧 sandbox 自然释放后逐步切换 |
+| **生产重大升级** (API 变更等) | S2 + S3 — Blue-Green 切换后排空旧 sandbox |
+| **紧急安全修复** | S1 + S3 — 滚动更新 + 立即排空 |
+| **零中断升级** (用户会话不丢失) | **S2 + S4** — Blue-Green 新 Pool + 共享 PVC 任务边界迁移 |
 
 ---
 
