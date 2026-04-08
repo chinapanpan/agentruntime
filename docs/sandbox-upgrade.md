@@ -302,150 +302,7 @@ kubectl -n $NS delete pool $NEW_POOL
 
 ---
 
-## 5. Strategy 3: 优雅排空运行中 Sandbox
-
-**适用场景**: 配合 Strategy 1 或 2 使用，强制升级仍在旧版本上运行的 BatchSandbox。
-
-**核心思路**: 通知 → 等待 → 删除旧 → 重建新。
-
-### 执行步骤
-
-**Step 1: 识别旧版本 BatchSandbox**
-
-```bash
-TARGET_POOL=${NEW_POOL:-$POOL_NAME}  # Blue-Green 用新 Pool，Rolling 用原 Pool
-NEW_REV=$(kubectl -n $NS get pool $TARGET_POOL -o jsonpath='{.status.revision}')
-
-echo "=== 需要升级的 BatchSandbox ==="
-for BS in $(kubectl -n $NS get batchsandbox -o jsonpath='{.items[*].metadata.name}'); do
-  POOL_REF=$(kubectl -n $NS get batchsandbox $BS -o jsonpath='{.spec.poolRef}' 2>/dev/null)
-
-  # Blue-Green: 还在旧 Pool 上的
-  if [ -n "$NEW_POOL" ] && [ "$POOL_REF" = "$POOL_NAME" ]; then
-    REPLICAS=$(kubectl -n $NS get batchsandbox $BS -o jsonpath='{.spec.replicas}')
-    echo "  $BS (pool=$POOL_REF, replicas=$REPLICAS) → 需要迁移到 $NEW_POOL"
-  fi
-done
-```
-
-**Step 2: 逐个优雅排空并重建**
-
-```bash
-DRAIN_TIMEOUT=300  # 秒
-TARGET_POOL=${NEW_POOL:-$POOL_NAME}
-
-for BS_NAME in $(kubectl -n $NS get batchsandbox -o jsonpath='{range .items[?(@.spec.poolRef=="'$POOL_NAME'")]}{.metadata.name}{" "}{end}'); do
-  echo "========================================="
-  echo "排空: $BS_NAME"
-  echo "========================================="
-
-  BS_REPLICAS=$(kubectl -n $NS get batchsandbox $BS_NAME -o jsonpath='{.spec.replicas}')
-
-  # 1. 通知 sandbox 内的工作负载准备关闭
-  ALLOC_RAW=$(kubectl -n $NS get batchsandbox $BS_NAME \
-    -o jsonpath='{.metadata.annotations.sandbox\.opensandbox\.io/alloc-status}' 2>/dev/null)
-  PODS=$(echo "$ALLOC_RAW" | python3.12 -c "
-import sys,json
-try:
-    data = json.load(sys.stdin)
-    for p in data.get('pods', []):
-        print(p)
-except: pass
-" 2>/dev/null)
-
-  for POD in $PODS; do
-    echo "  通知 Pod $POD 准备关闭..."
-    kubectl -n $NS exec $POD -- sh -c 'touch /tmp/shutdown-requested' 2>/dev/null || true
-  done
-
-  # 2. 等待优雅完成 (或超时)
-  echo "  等待 ${DRAIN_TIMEOUT}s 优雅完成..."
-  sleep $DRAIN_TIMEOUT &
-  WAIT_PID=$!
-
-  # 可在此检查业务层是否已完成 (如检查 /tmp/shutdown-complete 文件)
-  ELAPSED=0
-  while [ $ELAPSED -lt $DRAIN_TIMEOUT ]; do
-    ALL_DONE=true
-    for POD in $PODS; do
-      DONE=$(kubectl -n $NS exec $POD -- sh -c 'cat /tmp/shutdown-complete 2>/dev/null' 2>/dev/null)
-      if [ "$DONE" != "done" ]; then
-        ALL_DONE=false
-        break
-      fi
-    done
-    if [ "$ALL_DONE" = "true" ]; then
-      echo "  所有 Pod 已完成工作"
-      kill $WAIT_PID 2>/dev/null
-      break
-    fi
-    sleep 10
-    ELAPSED=$((ELAPSED + 10))
-  done
-
-  # 3. 删除旧 BatchSandbox
-  echo "  删除旧 BatchSandbox: $BS_NAME"
-  kubectl -n $NS delete batchsandbox $BS_NAME --timeout=60s
-
-  # 4. 在新 Pool 上重建
-  echo "  重建 BatchSandbox: $BS_NAME → pool=$TARGET_POOL"
-  cat <<EOF | kubectl apply -f -
-apiVersion: sandbox.opensandbox.io/v1alpha1
-kind: BatchSandbox
-metadata:
-  name: $BS_NAME
-  namespace: $NS
-spec:
-  replicas: ${BS_REPLICAS:-1}
-  poolRef: $TARGET_POOL
-EOF
-
-  # 5. 等待新 sandbox 就绪
-  for i in $(seq 1 60); do
-    READY=$(kubectl -n $NS get batchsandbox $BS_NAME -o jsonpath='{.status.ready}' 2>/dev/null)
-    if [ "$READY" = "${BS_REPLICAS:-1}" ]; then
-      echo "  重建完成: ready=$READY"
-      break
-    fi
-    sleep 2
-  done
-
-  echo ""
-done
-```
-
-**Step 3: 验证全部升级完成**
-
-```bash
-echo "=== 最终状态 ==="
-kubectl -n $NS get pool
-echo ""
-kubectl -n $NS get batchsandbox
-echo ""
-echo "=== 旧版本 Pod 数量 ==="
-kubectl -n $NS get pods -l sandbox.opensandbox.io/pool-name=$POOL_NAME --no-headers 2>/dev/null | wc -l
-```
-
-### 回滚
-
-如果重建失败，在旧 Pool（如果还存在）上重建:
-
-```bash
-kubectl -n $NS apply -f - <<EOF
-apiVersion: sandbox.opensandbox.io/v1alpha1
-kind: BatchSandbox
-metadata:
-  name: $BS_NAME
-  namespace: $NS
-spec:
-  replicas: ${BS_REPLICAS:-1}
-  poolRef: $POOL_NAME
-EOF
-```
-
----
-
-## 6. Strategy 4: 最小中断升级（状态外置 + 任务边界切换）
+## 5. Strategy 3: 最小中断升级（状态外置 + 任务边界切换）
 
 **适用场景**: 需要升级运行中 Sandbox 且不能丢失用户会话状态。
 
@@ -454,63 +311,98 @@ EOF
 ### 架构
 
 ```
-┌─────────────────────────────────────────────────┐
-│  AI Agent Service                               │
-│  ┌───────────────────────────────┐              │
-│  │ Session Manager               │              │
-│  │  - 追踪每个 session 的状态    │              │
-│  │  - 在任务边界触发迁移         │              │
-│  └──────────┬────────────────────┘              │
-│             │                                    │
-│  ┌──────────▼──────────┐  ┌───────────────────┐ │
-│  │ 旧 Sandbox (v1)     │  │ 新 Sandbox (v2)   │ │
-│  │ ┌────────────────┐  │  │ ┌───────────────┐ │ │
-│  │ │ [Task3] 执行中 │  │  │ │ [Task4] 待接收│ │ │
-│  │ └────────────────┘  │  │ └───────────────┘ │ │
-│  │     │               │  │     ▲             │ │
-│  │     ▼ 写入状态      │  │     │ 恢复状态    │ │
-│  └─────┼───────────────┘  └─────┼─────────────┘ │
-│        │                        │                │
-│  ┌─────▼────────────────────────┼──────────┐     │
-│  │     Shared PVC (EFS/EBS)                │     │
-│  │     /data/session-state.json            │     │
-│  │     /data/workspace/                    │     │
-│  └─────────────────────────────────────────┘     │
-└──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  AI Agent Service                                                │
+│  ┌───────────────────────────────────┐                           │
+│  │ Session Manager                    │                           │
+│  │  - 追踪每个 session 的状态         │                           │
+│  │  - 在任务边界触发迁移              │                           │
+│  │  - 强制 per-session 目录隔离       │                           │
+│  └──────────┬─────────────────────────┘                           │
+│             │                                                     │
+│  ┌──────────▼──────────┐  ┌───────────────────┐                  │
+│  │ 旧 Sandbox (v1)     │  │ 新 Sandbox (v2)   │                  │
+│  │ session-1 分配       │  │ session-1 迁移到此 │                  │
+│  │ ┌────────────────┐  │  │ ┌───────────────┐ │                  │
+│  │ │ [Task3] 执行中 │  │  │ │ [Task4] 待接收│ │                  │
+│  │ └────────────────┘  │  │ └───────────────┘ │                  │
+│  │     │               │  │     ▲             │                  │
+│  │     ▼ save_state    │  │     │ restore     │                  │
+│  └─────┼───────────────┘  └─────┼─────────────┘                  │
+│        │   仅访问 session-1     │                                 │
+│  ┌─────▼────────────────────────┼──────────────────────────────┐  │
+│  │  EFS PVC (/data)                                            │  │
+│  │  /data/sessions/                                            │  │
+│  │    ├── session-1/           ← 新旧 sandbox 共享 (迁移中)    │  │
+│  │    │   ├── state.json                                       │  │
+│  │    │   └── workspace/                                       │  │
+│  │    ├── session-2/           ← 其他 session，互不访问        │  │
+│  │    │   ├── state.json                                       │  │
+│  │    │   └── workspace/                                       │  │
+│  │    └── session-N/                                           │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 **中断时间**: 仅在任务边界切换，用户感知 **0 中断**（当前任务完成后无缝衔接）。
 
-### 方案 A: 共享 PVC + 任务边界切换
+### Per-Session 目录隔离模型
 
-最实用的方案。利用 EFS（NFS）作为共享存储，新旧 Sandbox 都挂载同一 PVC。
+OpenSandbox Pool 的所有 Pod 使用相同 PodTemplateSpec（源码: `pool_controller.go:createPoolPod()`），无法在 Kubernetes 层面实现 per-pod 卷定制。因此采用**应用层目录隔离**:
 
-**Step 1: 创建共享 EFS 存储 (一次性)**
+| 层面 | 隔离方式 |
+|------|---------|
+| **EFS 挂载** | 所有 Pool Pod 挂载同一 PVC 到 `/data` (Pool 模型要求) |
+| **目录隔离** | Agent 为每个 session 创建独立子目录 `/data/sessions/{session-id}/` |
+| **访问控制** | Agent 强制限定所有操作在 session 目录内，不访问其他 session 目录 |
+| **升级共享** | 新旧 sandbox 通过相同 session-id 访问同一子目录，实现状态迁移 |
+
+**目录结构**:
+
+```
+/data/sessions/
+├── {session-id-1}/
+│   ├── state.json          # 会话状态 (环境变量、工作目录、历史)
+│   └── workspace/          # 工作文件
+├── {session-id-2}/         # 其他 session，互不访问
+│   ├── state.json
+│   └── workspace/
+└── ...
+```
+
+**生命周期**: session claim 时创建目录 → 运行期间读写 → 升级迁移时新旧共享 → session 结束后清理。
+
+> **安全说明**: Pool Pod 在文件系统层面技术上可访问 `/data/sessions/` 下所有目录。隔离由 Agent 服务层强制执行。未来 OpenSandbox Pool CRD 可能支持 per-pod volumeClaimTemplates (类似 StatefulSet)，届时可实现文件系统级隔离。
+
+### 方案 A: Per-Session EFS 隔离 + 任务边界切换
+
+最实用的方案。利用 EFS（NFS）作为共享存储，Agent 通过 per-session 目录隔离确保 sandbox 间数据不共享，升级时新旧 sandbox 通过 session-id 定向共享。
+
+**Step 1: 创建 EFS 存储 (一次性)**
 
 ```bash
-# 创建 EFS StorageClass (如果尚未创建)
-cat <<'EOF' | kubectl apply -f -
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
+# 创建静态 PV (推荐，无需额外 IAM 配置)
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolume
 metadata:
-  name: efs-sc
-provisioner: efs.csi.aws.com
-parameters:
-  provisioningMode: efs-ap
-  fileSystemId: <YOUR_EFS_ID>
-  directoryPerms: "700"
-EOF
-
-# 创建 PVC
-cat <<'EOF' | kubectl apply -f -
+  name: efs-sandbox-pv
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes: [ReadWriteMany]
+  storageClassName: efs-sc
+  csi:
+    driver: efs.csi.aws.com
+    volumeHandle: <YOUR_EFS_ID>
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: sandbox-shared-state
   namespace: opensandbox-system
 spec:
-  accessModes:
-    - ReadWriteMany        # EFS 支持多 Pod 同时读写
+  accessModes: [ReadWriteMany]
   storageClassName: efs-sc
   resources:
     requests:
@@ -518,10 +410,9 @@ spec:
 EOF
 ```
 
-**Step 2: Pool 模板中挂载共享 PVC**
+**Step 2: Pool 模板中挂载 EFS PVC**
 
-```bash
-cat <<'EOF' | kubectl apply -f -
+```yaml
 apiVersion: sandbox.opensandbox.io/v1alpha1
 kind: Pool
 metadata:
@@ -533,7 +424,7 @@ spec:
       runtimeClassName: kata-clh
       containers:
       - name: sandbox
-        image: busybox:1.37          # 新镜像
+        image: busybox:1.37
         command: ["sh", "-c", "while true; do sleep 3600; done"]
         resources:
           requests:
@@ -541,7 +432,7 @@ spec:
             memory: 128Mi
         volumeMounts:
         - name: shared-state
-          mountPath: /data
+          mountPath: /data      # 所有 Pod 挂载同一路径
       volumes:
       - name: shared-state
         persistentVolumeClaim:
@@ -551,30 +442,39 @@ spec:
     bufferMax: 10
     poolMin: 5
     poolMax: 50
-EOF
+# 注意: 所有 Pod 共享 /data 挂载点，per-session 隔离由 Agent 层强制
 ```
 
-**Step 3: AI Agent 侧 — 任务边界迁移逻辑**
+**Step 3: AI Agent 侧 — Per-Session 隔离 + 任务边界迁移**
 
 ```python
 # AI Agent Service 伪代码
-import json, os
+import json, os, hashlib
 
 class SandboxSession:
     def __init__(self, session_id, sandbox_client):
         self.session_id = session_id
         self.sandbox = sandbox_client
-        self.state_path = f"/data/sessions/{session_id}/state.json"
+        self.session_dir = f"/data/sessions/{session_id}"
+        self.state_path = f"{self.session_dir}/state.json"
+
+    def setup_session_directory(self):
+        """claim sandbox 后，创建 session 专属目录"""
+        self.sandbox.exec(f"mkdir -p {self.session_dir}/workspace")
+        self.sandbox.exec(f"chmod 700 {self.session_dir}")
+
+    def scoped_exec(self, cmd):
+        """所有命令限定在 session 目录内执行"""
+        return self.sandbox.exec(f"cd {self.session_dir}/workspace && {cmd}")
 
     def save_state(self):
-        """将会话状态写入共享存储"""
+        """将会话状态写入 session 专属目录"""
         state = {
             "session_id": self.session_id,
             "env_vars": self.get_env_vars(),
             "working_dir": self.get_cwd(),
             "history": self.get_command_history(),
         }
-        self.sandbox.exec(f"mkdir -p /data/sessions/{self.session_id}")
         self.sandbox.exec(
             f"cat > {self.state_path} << 'STATEEOF'\n"
             f"{json.dumps(state)}\n"
@@ -582,7 +482,7 @@ class SandboxSession:
         )
 
     def restore_state(self):
-        """从共享存储恢复会话状态"""
+        """从 session 专属目录恢复状态"""
         raw = self.sandbox.exec(f"cat {self.state_path}")
         state = json.loads(raw)
         for k, v in state["env_vars"].items():
@@ -590,18 +490,15 @@ class SandboxSession:
         self.sandbox.exec(f"cd {state['working_dir']}")
 
     def migrate_to_new_sandbox(self, new_sandbox):
-        """任务完成后，迁移到新 Sandbox"""
-        # 1. 保存当前状态
+        """任务完成后，迁移到新 Sandbox (新旧共享同一 session 目录)"""
         self.save_state()
-
-        # 2. 切换到新 Sandbox (新镜像, 同 PVC)
         self.sandbox = new_sandbox
-
-        # 3. 恢复状态
+        # 新 sandbox 挂载同一 EFS，通过 session-id 访问同一目录
         self.restore_state()
 
-        # 4. 继续接收新任务
-        print(f"Session {self.session_id} migrated to new sandbox")
+    def cleanup_session_directory(self):
+        """session 结束后清理 (非迁移场景)"""
+        self.sandbox.exec(f"rm -rf {self.session_dir}")
 ```
 
 **Step 4: 执行升级流程**
@@ -612,42 +509,16 @@ export NEW_POOL=kata-clh-pool-v2
 # ... (同 Strategy 2 Step 1-3)
 
 # 2. 对每个活跃 session，在当前任务完成后:
-#    a) 从新 Pool claim 新 Sandbox
-#    b) 新 Sandbox 自动挂载相同 PVC
-#    c) Agent 调用 restore_state() 恢复会话
-#    d) 删除旧 BatchSandbox
+#    a) Agent 调用 save_state() 保存到 /data/sessions/{session-id}/
+#    b) 从新 Pool claim 新 Sandbox (自动挂载同一 EFS PVC)
+#    c) 新 Sandbox 通过 session-id 访问同一目录
+#    d) Agent 调用 restore_state() 恢复会话
+#    e) 删除旧 BatchSandbox
 
 # 3. 旧 Pool 自然排空后删除
 ```
 
-### 方案 B: Ingress 路由切换
-
-利用 OpenSandbox Ingress Gateway 的路由能力，在代理层切换后端 Sandbox。
-
-```
-Client → Ingress Gateway → [sandbox-id 路由] → 新 Sandbox Pod
-                                              ↗ (路由更新)
-                           [sandbox-id 路由] → 旧 Sandbox Pod (断开)
-```
-
-**原理**: OpenSandbox Ingress 支持 header-based 和 URI-based 路由:
-- Header: `OpenSandbox-Ingress-To: <sandbox-id>-<port>`
-- URI: `/<sandbox-id>/<sandbox-port>/<path>`
-
-当新 Sandbox 就绪后，更新路由指向新 Pod，客户端下次请求自动到新 Sandbox。
-
-```bash
-# 迁移步骤:
-# 1. 创建新 BatchSandbox (新 Pool)
-# 2. 获取新 Pod 的 sandbox-id
-# 3. 更新 Ingress 路由映射 (session → new sandbox-id)
-# 4. 客户端下次请求自动路由到新 Sandbox
-# 5. 删除旧 BatchSandbox
-```
-
-**中断**: WebSocket 连接会断开需重连，HTTP 请求无感知切换。
-
-### 方案 C: OSEP-0008 Pause/Resume (未来)
+### 方案 B: OSEP-0008 Pause/Resume (未来)
 
 OpenSandbox 正在实现 **rootfs snapshot** 机制 (OSEP-0008):
 
@@ -663,27 +534,27 @@ Resume: 从 snapshot 镜像 → 创建新 Sandbox → 文件系统完整恢复
 
 ---
 
-## 7. 策略对比与推荐
+## 6. 策略对比与推荐
 
-| | S1: 滚动更新 | S2: Blue-Green | S3: 优雅排空 | S4: 状态外置+任务边界 |
-|--|-------------|---------------|-------------|-------------------|
-| **范围** | 仅空闲 Pod | 全量 (新 Pool) | 已分配 Pod | 已分配 Pod |
-| **会话状态** | 不影响 | 不影响 | 丢失 | **保留** ✅ |
-| **用户感知中断** | 无 | 无 | 短暂中断 | **零中断** ✅ |
-| **升级期间新 Claim** | 正常 | 正常 | 正常 | 正常 |
-| **资源开销** | 1x Pool | 2x Pool | 1x Pool | 2x Pool + PVC |
-| **复杂度** | 低 | 中 | 高 | 高 (需改 Agent) |
-| **回滚速度** | 快 | 快 | 手动 | 快 (切回旧 Pool) |
-| **前提条件** | 无 | 无 | 无 | 共享 PVC (EFS) |
+| | S1: 滚动更新 | S2: Blue-Green | S3: 状态外置+任务边界 |
+|--|-------------|---------------|-------------------|
+| **范围** | 仅空闲 Pod | 全量 (新 Pool) | 已分配 Pod |
+| **会话状态** | 不影响 | 不影响 | **保留** ✅ |
+| **用户感知中断** | 无 | 无 | **零中断** ✅ |
+| **Session 间隔离** | N/A | N/A | Per-Session 目录隔离 |
+| **升级期间新 Claim** | 正常 | 正常 | 正常 |
+| **资源开销** | 1x Pool | 2x Pool | 2x Pool + EFS PVC |
+| **复杂度** | 低 | 中 | 高 (需改 Agent) |
+| **回滚速度** | 快 | 快 | 快 (切回旧 Pool) |
+| **前提条件** | 无 | 无 | EFS + Agent 隔离实现 |
 
 ### 推荐组合
 
 | 场景 | 推荐方案 |
 |------|---------|
 | **日常镜像更新** (安全补丁等) | S1 — 旧 sandbox 自然释放后逐步切换 |
-| **生产重大升级** (API 变更等) | S2 + S3 — Blue-Green 切换后排空旧 sandbox |
-| **紧急安全修复** | S1 + S3 — 滚动更新 + 立即排空 |
-| **零中断升级** (用户会话不丢失) | **S2 + S4** — Blue-Green 新 Pool + 共享 PVC 任务边界迁移 |
+| **生产重大升级** (API 变更等) | S2 — Blue-Green 切换，旧 sandbox 自然释放 |
+| **零中断升级** (用户会话不丢失) | **S2 + S3** — Blue-Green 新 Pool + Per-Session EFS 隔离 + 任务边界迁移 |
 
 ---
 
