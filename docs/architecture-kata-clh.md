@@ -19,21 +19,30 @@ graph TB
 
         subgraph "VPC"
             subgraph "Private Subnets"
-                subgraph "c5.metal Node 1"
-                    KVM1["/dev/kvm"]
-                    CD1["containerd + kata-clh shim"]
-                    subgraph "Pool Pods (Node 1)"
-                        P1["microVM Pod 1 ✓"]
-                        P2["microVM Pod 2 ✓"]
-                        P3["microVM Pod 3 ✓"]
+                subgraph "Managed Nodegroup — 基线 (常驻)"
+                    subgraph "c5.metal Node 1"
+                        KVM1["/dev/kvm"]
+                        CD1["containerd + kata-clh shim"]
+                        subgraph "Pool Pods (Node 1)"
+                            P1["microVM Pod 1 ✓"]
+                            P2["microVM Pod 2 ✓"]
+                            P3["microVM Pod 3 ✓"]
+                        end
                     end
                 end
-                subgraph "c5.metal Node 2"
-                    KVM2["/dev/kvm"]
-                    CD2["containerd + kata-clh shim"]
-                    subgraph "Pool Pods (Node 2)"
-                        P4["microVM Pod 4 ✓"]
-                        P5["microVM Pod 5 ✓"]
+                subgraph "Karpenter-Managed — 突发 (自动扩缩)"
+                    subgraph "c5.metal Node 2 (预热备用)"
+                        KVM2["/dev/kvm"]
+                        CD2["containerd + kata-clh shim"]
+                        PAUSE["pause Pod (低优先级占位)"]
+                    end
+                    subgraph "c5.metal Node 3 (按需扩容)"
+                        KVM3["/dev/kvm"]
+                        CD3["containerd + kata-clh shim"]
+                        subgraph "Pool Pods (Node 3)"
+                            P4["microVM Pod 4 ✓"]
+                            P5["microVM Pod 5 ✓"]
+                        end
                     end
                 end
             end
@@ -47,6 +56,7 @@ graph TB
         end
 
         subgraph "kube-system (namespace)"
+            KARP["Karpenter Controller"]
             KATA["kata-deploy DaemonSet"]
         end
     end
@@ -57,10 +67,13 @@ graph TB
     POOL -->|"③ Assign Pod"| P1
     Agent -->|"④ kubectl exec"| P1
 
+    KARP -->|"检测 Pending Pod → 启动 c5.metal"| KVM3
     KATA -->|"安装 kata-clh shim"| CD1
     KATA -->|"安装 kata-clh shim"| CD2
+    KATA -->|"安装 kata-clh shim"| CD3
     CD1 --> KVM1
     CD2 --> KVM2
+    CD3 --> KVM3
 ```
 
 ### 1.2 组件清单
@@ -68,7 +81,10 @@ graph TB
 | 组件 | 部署方式 | 说明 |
 |------|---------|------|
 | **EKS Control Plane** | AWS 托管 | K8s API Server + etcd |
-| **c5.metal Worker Nodes** | Managed Nodegroup | 裸金属实例，提供 /dev/kvm |
+| **c5.metal Worker Nodes** | Managed Nodegroup (基线) + Karpenter (突发) | 裸金属实例，提供 /dev/kvm |
+| **Karpenter** | Deployment (kube-system) | 节点自动扩缩容，检测 Pending Pod → 启动新 c5.metal |
+| **EC2NodeClass + NodePool** | Custom Resource | Karpenter 的 c5.metal 实例配置 |
+| **Node Warmer** | Deployment (kube-system) | 低优先级 pause Pod，预热备用 c5.metal 节点 |
 | **kata-deploy** | DaemonSet (kube-system) | 在每个节点安装 Kata 运行时 + containerd shim |
 | **OpenSandbox Controller** | Deployment (opensandbox-system) | 管理 Pool 和 BatchSandbox |
 | **Pool CRD** | Custom Resource | 定义预热 Pod 池 |
@@ -103,6 +119,102 @@ graph TB
 - **独立文件系统**: 用户代码无法访问其他 VM 或宿主机
 - **硬件级隔离**: 通过 KVM + Cloud Hypervisor 实现 CPU/内存/IO 隔离
 - **标准 Pod 网络**: 通过 virtio-net + VPC CNI 获得 Pod IP
+
+### 1.4 节点自动扩容架构
+
+#### 混合部署策略
+
+采用 **Managed Nodegroup 基线 + Karpenter 突发 + Pause Pod 预热** 三层策略:
+
+| 层级 | 组件 | 节点数 | 说明 |
+|------|------|--------|------|
+| **基线** | Managed Nodegroup | 1 c5.metal (常驻) | 保证最低容量，Pool bufferMin 的 Pod 运行于此 |
+| **预热** | Karpenter + Pause Pod | 1 c5.metal (热备) | 低优先级占位 Pod 迫使 Karpenter 预留节点 |
+| **突发** | Karpenter | 0-N c5.metal (按需) | 超出预热容量时自动扩容 |
+
+#### 自动扩容链路
+
+当 Pool 回填 Pod 但现有节点资源不足时，触发以下链路:
+
+```
+Pool available < bufferMin
+  → Controller 创建新 Pod (Pending)
+    → Scheduler: 现有节点有空间?
+      ├─ 是 → Pod Running (~3.2s cold start) → 正常回填
+      └─ 否 → 预热节点有 pause Pod?
+           ├─ 是 → 抢占 pause Pod → Pod Running (~3.2s)
+           │       → Karpenter 异步为被驱逐的 pause Pod 补充新预热节点
+           └─ 否 → Karpenter 启动新 c5.metal (~5-8 min)
+                  → kata-deploy DaemonSet 安装 Kata runtime (~3-5 min)
+                  → Pod Running (~3.2s)
+```
+
+#### 各场景延迟对比
+
+| 场景 | Pod 就绪时间 | 实测数据 (2026-04-13) |
+|------|-------------|----------------------|
+| Warm Pool Claim (节点存在, Pod 预热) | **~194ms** | avg 194ms [167,140,268,145,248] |
+| Pool 回填 (节点存在, Pod 冷启动) | **~3.4s** | avg 3385ms |
+| 突发到预热节点 (抢占 pause Pod) | **~3.4s** | Pause Pod 被驱逐，真实 Pod 即时调度 |
+| 突发到冷节点 (新 c5.metal) | **~3 min** | EC2 ~44s + kata-deploy ~2.5min |
+
+#### Pause Pod 预热机制
+
+通过 PriorityClass 抢占实现节点预热，这是 Kubernetes 社区的标准做法:
+
+1. **低优先级占位**: `node-warm-placeholder` PriorityClass (value: -1)
+2. **资源占满**: pause 容器请求 80 vCPU / 160Gi，接近 c5.metal 全部资源
+3. **触发扩容**: Karpenter 为占位 Pod 启动新 c5.metal + kata-deploy 自动安装
+4. **按需抢占**: 真实 Pool Pod (PriorityClass 默认 0 > -1) 到来时，Scheduler 驱逐 pause Pod
+5. **自动补充**: 被驱逐的 pause Pod 变为 Pending → Karpenter 异步启动下一台预热节点
+
+```yaml
+# 低优先级占位 PriorityClass
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: node-warm-placeholder
+value: -1
+globalDefault: false
+description: "c5.metal 节点预热占位，真实工作负载到来时被抢占"
+---
+# 预热节点 Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-warmer
+  namespace: kube-system
+spec:
+  replicas: 1                        # 预热 1 台 c5.metal 备用节点
+  selector:
+    matchLabels:
+      app: node-warmer
+  template:
+    metadata:
+      labels:
+        app: node-warmer
+    spec:
+      priorityClassName: node-warm-placeholder
+      terminationGracePeriodSeconds: 0
+      affinity:
+        nodeAffinity:               # 关键: 仅调度到 Karpenter 节点
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: karpenter.sh/nodepool
+                operator: Exists
+      tolerations:
+        - operator: Exists
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.9
+        resources:
+          requests:
+            cpu: "80"
+            memory: "160Gi"
+```
+
+> **调整预热节点数**: 修改 `replicas` 即可增减预热备用节点数量。每增加 1 个 replica 对应 1 台 c5.metal 热备。
 
 ---
 
@@ -448,3 +560,18 @@ kubectl -n opensandbox-system delete batchsandbox cold-demo
 | 高 (> 50 QPS) | 50 | 100 | 200 |
 
 `bufferMin` 应 >= 预期突发峰值。
+
+### 5.3 自动扩容成本模型
+
+| 配置 | 月成本 (On-Demand) | 月成本 (Spot) | 说明 |
+|------|-------------------|--------------|------|
+| 1 c5.metal 基线 (Managed Nodegroup) | ~$3,643 | 不适用 (需常驻) | 最低保障，不可缩容 |
+| +1 c5.metal 预热 (Karpenter + Pause Pod) | +$3,643 | ~$1,095-$1,460 | 热备节点，可用 Spot 降低成本 |
+| 突发节点 (Karpenter 按需扩容) | 按实际使用计费 | 按实际使用计费 | 空闲 30 min 后 Karpenter 自动回收 |
+
+**建议配置**:
+- **最低配置**: 1 基线 + 0 预热 = ~$3,643/月。适合低并发、可接受偶尔 ~10 min 扩容延迟的场景。
+- **推荐配置**: 1 基线 + 1 预热 = ~$4,738-$7,286/月 (Spot/On-Demand)。突发时 Pod 秒级就绪。
+- **高并发配置**: 1 基线 + 2 预热 = ~$5,833-$10,929/月。更大的突发缓冲。
+
+> 成本基于 ap-northeast-1 (Tokyo) 的 c5.metal On-Demand $5.06/hr 计算。

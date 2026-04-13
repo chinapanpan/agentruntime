@@ -42,8 +42,12 @@ export REGION=us-west-2          # 修改为目标 Region
 export CLUSTER_NAME=sandbox-prod
 export K8S_VERSION=1.34
 export NODE_TYPE=c5.metal
-export NODE_COUNT=2
+export NODE_COUNT=1                  # 基线节点数 (Karpenter 处理突发扩容)
 export OPENSANDBOX_NS=opensandbox-system
+
+# ===== Karpenter 配置 =====
+export KARPENTER_VERSION=1.3.0       # Karpenter 版本
+export WARM_SPARE_NODES=1            # 预热备用节点数
 
 # ===== 验证 =====
 echo "AWS Account: ${AWS_ACCOUNT_ID}"
@@ -83,17 +87,19 @@ eksctl create cluster \
 [✔]  EKS cluster "sandbox-prod" in "us-west-2" region is ready
 ```
 
-### 1.2 创建 c5.metal 节点组
+### 1.2 创建 c5.metal 基线节点组
+
+> **说明**: 此节点组为常驻基线 (1 台 c5.metal)，保证 Pool bufferMin 的 Pod 始终有节点可用。突发扩容由 Karpenter 处理 (见 Step 1.5)。
 
 ```bash
 eksctl create nodegroup \
   --cluster ${CLUSTER_NAME} \
   --region ${REGION} \
-  --name kata-metal \
+  --name kata-metal-baseline \
   --node-type ${NODE_TYPE} \
   --nodes ${NODE_COUNT} \
   --nodes-min 1 \
-  --nodes-max 4 \
+  --nodes-max 2 \
   --node-volume-size 100 \
   --managed
 ```
@@ -158,6 +164,271 @@ kubectl delete pod kvm-check --force
 **故障排除**:
 - `/dev/kvm` 不存在 → 节点不是裸金属实例，确认使用了 `c5.metal`
 - 节点长时间 NotReady → 检查安全组是否允许与 EKS 控制平面通信
+
+---
+
+## Step 1.5: 部署 Karpenter 节点自动扩容
+
+> **目的**: 当 Pool 回填 Pod 超出基线节点容量时，Karpenter 自动配置新的 c5.metal 节点。
+> 配合 Pause Pod 预热机制，避免裸金属实例 ~8-13 min 冷启动延迟。
+>
+> **注意**: c5.metal 是裸金属实例，/dev/kvm 由硬件直接提供，使用**官方 Karpenter** 即可，无需自定义构建。
+
+### 1.5.1 创建 Karpenter IAM 资源
+
+```bash
+# 方式 A: 使用 eksctl 创建 Pod Identity Association (推荐)
+eksctl create podidentityassociation \
+  --cluster ${CLUSTER_NAME} \
+  --region ${REGION} \
+  --namespace kube-system \
+  --service-account-name karpenter \
+  --well-known-policies karpenterController
+
+# 创建 Karpenter 节点角色
+cat <<'EOF' > /tmp/karpenter-node-trust-policy.json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "ec2.amazonaws.com" },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+
+aws iam create-role \
+  --role-name "KarpenterNodeRole-${CLUSTER_NAME}" \
+  --assume-role-policy-document file:///tmp/karpenter-node-trust-policy.json \
+  --region ${REGION} 2>/dev/null || true
+
+for POLICY in AmazonEKSWorkerNodePolicy AmazonEKS_CNI_Policy AmazonEC2ContainerRegistryReadOnly AmazonSSMManagedInstanceCore; do
+  aws iam attach-role-policy \
+    --role-name "KarpenterNodeRole-${CLUSTER_NAME}" \
+    --policy-arn "arn:aws:iam::aws:policy/${POLICY}"
+done
+
+# 允许 Karpenter 节点加入集群
+eksctl create iamidentitymapping \
+  --cluster ${CLUSTER_NAME} \
+  --region ${REGION} \
+  --arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/KarpenterNodeRole-${CLUSTER_NAME}" \
+  --username system:node:{{EC2PrivateDNSName}} \
+  --group system:bootstrappers --group system:nodes
+```
+
+### 1.5.2 标记子网和安全组
+
+Karpenter 通过 `karpenter.sh/discovery` 标签发现网络资源:
+
+```bash
+# 标记子网
+for SUBNET_ID in $(aws eks describe-cluster --name ${CLUSTER_NAME} --region ${REGION} \
+  --query 'cluster.resourcesVpcConfig.subnetIds' --output text); do
+  aws ec2 create-tags --resources ${SUBNET_ID} \
+    --tags Key=karpenter.sh/discovery,Value=${CLUSTER_NAME} --region ${REGION}
+done
+
+# 标记集群安全组
+CLUSTER_SG=$(aws eks describe-cluster --name ${CLUSTER_NAME} --region ${REGION} \
+  --query 'cluster.resourcesVpcConfig.clusterSecurityGroupId' --output text)
+aws ec2 create-tags --resources ${CLUSTER_SG} \
+  --tags Key=karpenter.sh/discovery,Value=${CLUSTER_NAME} --region ${REGION}
+
+echo "Subnets and Security Group tagged for Karpenter discovery"
+```
+
+### 1.5.3 安装 Karpenter
+
+```bash
+helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+  --namespace kube-system \
+  --version ${KARPENTER_VERSION} \
+  --set "settings.clusterName=${CLUSTER_NAME}" \
+  --wait --timeout 120s
+```
+
+**验证**:
+```bash
+kubectl -n kube-system get pods -l app.kubernetes.io/name=karpenter
+# 预期: karpenter-xxxxx 1/1 Running
+```
+
+### 1.5.4 创建 EC2NodeClass
+
+```bash
+cat <<EOF | kubectl apply -f -
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: kata-metal
+spec:
+  role: "KarpenterNodeRole-${CLUSTER_NAME}"
+  amiSelectorTerms:
+    - alias: al2023@latest
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "${CLUSTER_NAME}"
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "${CLUSTER_NAME}"
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        deleteOnTermination: true
+EOF
+```
+
+> **注意**: 无需 `cpuOptions` 配置。c5.metal 是裸金属实例，硬件直接提供 /dev/kvm，
+> 与 c8i 嵌套虚拟化方案 (需要自定义 Karpenter + PR #9043) 不同。
+
+### 1.5.5 创建 NodePool
+
+```bash
+cat <<'EOF' | kubectl apply -f -
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: kata-metal-burst
+spec:
+  template:
+    metadata:
+      labels:
+        katacontainers.io/kata-runtime: "true"
+        node-role: "kata-burst"
+    spec:
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["c5.metal"]
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: kata-metal
+      expireAfter: 720h
+  limits:
+    cpu: "480"                       # 最多 5 台 c5.metal (5 × 96 vCPU)
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30m            # 空闲 30 min 后回收节点
+EOF
+```
+
+### 1.5.6 配置节点预热 (Pause Pod)
+
+c5.metal 裸金属实例冷启动需 ~8-13 min (EC2 启动 + kata-deploy)。通过低优先级 Pause Pod 预热备用节点:
+
+```bash
+cat <<'EOF' | kubectl apply -f -
+# 低优先级 PriorityClass
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: node-warm-placeholder
+value: -1
+globalDefault: false
+description: "c5.metal 节点预热占位，真实工作负载到来时被抢占"
+---
+# 预热 Deployment: 每个 replica 占满 1 台 c5.metal
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-warmer
+  namespace: kube-system
+spec:
+  replicas: 1                        # 预热 1 台备用节点 (可调整)
+  selector:
+    matchLabels:
+      app: node-warmer
+  template:
+    metadata:
+      labels:
+        app: node-warmer
+    spec:
+      priorityClassName: node-warm-placeholder
+      terminationGracePeriodSeconds: 0
+      affinity:
+        nodeAffinity:                # 关键: 仅调度到 Karpenter 节点，避免占用基线节点
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: karpenter.sh/nodepool
+                operator: Exists
+      tolerations:
+        - operator: Exists
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.9
+        resources:
+          requests:
+            cpu: "80"
+            memory: "160Gi"
+EOF
+```
+
+**工作原理**:
+1. Pause Pod 请求 80 vCPU / 160Gi → 无法调度到基线节点 (已有 Pool Pod)
+2. Karpenter 启动新 c5.metal → kata-deploy 自动安装 → Pause Pod Running
+3. 当真实 Pool Pod 需要扩容时，Scheduler 抢占 Pause Pod (优先级 -1 < 默认 0)
+4. Pool Pod 即时调度到已预热的节点 (~3.2s 冷启动)
+5. Karpenter 为被驱逐的 Pause Pod 异步启动下一台预热节点
+
+### 1.5.7 验证 Karpenter + 预热
+
+```bash
+echo "=== Karpenter Pods ==="
+kubectl -n kube-system get pods -l app.kubernetes.io/name=karpenter
+
+echo ""
+echo "=== NodePool & EC2NodeClass ==="
+kubectl get nodepool kata-metal-burst
+kubectl get ec2nodeclass kata-metal
+
+echo ""
+echo "=== 等待预热节点 Ready (c5.metal 裸金属需 ~8-13 min) ==="
+for i in $(seq 1 30); do
+  NODES=$(kubectl get nodes -l node-role=kata-burst --no-headers 2>/dev/null | wc -l)
+  if [ "$NODES" -ge 1 ]; then
+    echo "预热节点就绪!"
+    kubectl get nodes -l node-role=kata-burst
+    break
+  fi
+  echo "  [${i}] 等待中... (已等待 $((i * 30))s)"
+  sleep 30
+done
+
+echo ""
+echo "=== Pause Pod 状态 ==="
+kubectl -n kube-system get pods -l app=node-warmer
+
+echo ""
+echo "=== 验证预热节点 /dev/kvm ==="
+KARP_NODE=$(kubectl get nodes -l node-role=kata-burst -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -n "$KARP_NODE" ]; then
+  kubectl debug node/${KARP_NODE} -it --image=ubuntu:22.04 -- \
+    bash -c 'ls -la /dev/kvm && echo "/dev/kvm OK"' 2>/dev/null || \
+    echo "注意: 需要等 kata-deploy 完成后 /dev/kvm 才可用于 Kata Pod"
+fi
+```
+
+**预期结果**:
+- Karpenter Pod: Running
+- 预热节点: 1 台 c5.metal Ready (label: `node-role=kata-burst`)
+- Pause Pod: 1/1 Running
+- `/dev/kvm`: 存在 (`crw-rw-rw-`)
 
 ---
 
@@ -681,6 +952,23 @@ echo "Test resources cleaned"
 ## Step 6: 清理全部资源
 
 ```bash
+# 删除节点预热资源
+kubectl delete deployment node-warmer -n kube-system 2>/dev/null
+kubectl delete priorityclass node-warm-placeholder 2>/dev/null
+
+# 删除 Karpenter NodePool 和 EC2NodeClass (等待 Karpenter 回收节点)
+kubectl delete nodepool kata-metal-burst 2>/dev/null
+kubectl delete ec2nodeclass kata-metal 2>/dev/null
+echo "等待 Karpenter 回收节点..."
+sleep 60
+
+# 卸载 Karpenter
+helm uninstall karpenter -n kube-system 2>/dev/null
+
+# 删除 Karpenter IAM 资源
+aws iam delete-role --role-name "KarpenterNodeRole-${CLUSTER_NAME}" 2>/dev/null || \
+  echo "注意: 如果角色有附加策略，需先 detach"
+
 # 删除 OpenSandbox 资源
 kubectl -n ${OPENSANDBOX_NS} delete batchsandbox --all
 kubectl -n ${OPENSANDBOX_NS} delete pool --all
@@ -729,13 +1017,44 @@ kubectl get runtimeclass | grep kata
 | 组件 | 版本 |
 |------|------|
 | EKS | 1.34 |
+| Karpenter | 1.3.0 |
 | Kata Containers | 3.28.0 |
 | OpenSandbox Controller | 0.1.0 |
 | Cloud Hypervisor | (bundled in Kata) |
 
+## 故障排除: Karpenter + c5.metal
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| Karpenter 不启动新节点 | 子网/安全组缺少 `karpenter.sh/discovery` 标签 | 重新执行 Step 1.5.2 标记资源 |
+| Karpenter 日志报 IAM 错误 | Pod Identity 或节点角色权限不足 | 检查 `eksctl get podidentityassociation` 和角色策略 |
+| c5.metal 启动较慢 | 裸金属实例启动比虚拟机慢 | 实测 ~44s Node Ready + ~2.5min kata-deploy ≈ 3min 端到端 |
+| 新节点上 Pod 报 FailedCreatePodSandBox | kata-deploy 尚未在新节点完成安装 | 等待 ~2-3 min，kata-deploy 完成后 Pod 自动重试成功 |
+| Pause Pod 调度到基线节点 | 缺少 nodeAffinity 约束 | Pause Pod 必须配置 `nodeAffinity: karpenter.sh/nodepool Exists` |
+| c5.metal 配额不足 | AWS 账户 c5.metal 实例数限制 | 在 Service Quotas 控制台申请提额 |
+| Pause Pod 未被抢占 | Pool Pod 优先级不高于 -1 | 确认 Pool Pod 未设置低于 -1 的 PriorityClass (默认 0 即可) |
+| Karpenter 过早回收预热节点 | consolidateAfter 设置太短 | 增大 `consolidateAfter` 值 (默认 30m) |
+
+> **与嵌套虚拟化方案的区别**: 本部署使用**官方 Karpenter + c5.metal 裸金属**，无需自定义构建、无需 PR #9043、无需 `cpuOptions`。
+> 嵌套虚拟化方案 (c8i/m8i + 自定义 Karpenter) 的文档见 `docs/karpenter-nested-virt-verification.md`。
+
 ## 历史测试结果
 
-| Region | 日期 | Warm Pool Claim | Batch 10 | Cold Start | 通过 |
-|--------|------|----------------|----------|------------|------|
-| us-west-2 | 2026-03-31 | avg 193ms [154,134,274,157,247] | 271ms | avg 2835ms [2732,2376,3071,3064,2934] | ✅ |
-| ap-northeast-1 | 2026-03-30 | avg 277ms [293,288,253,258,291] | 241ms | avg 3209ms [3077,3091,3871,3082,2923] | ✅ |
+| Region | 日期 | 配置 | Warm Pool Claim | Batch 10 | Cold Start | 通过 |
+|--------|------|------|----------------|----------|------------|------|
+| ap-northeast-1 | 2026-04-13 | c5.metal + Karpenter + Pause Pod 预热 | avg 194ms [167,140,268,145,248] | 139ms | avg 3385ms [3263,3633,3396,2945,3689] | ✅ |
+| us-west-2 | 2026-03-31 | c5.metal Managed Nodegroup | avg 193ms [154,134,274,157,247] | 271ms | avg 2835ms [2732,2376,3071,3064,2934] | ✅ |
+| ap-northeast-1 | 2026-03-30 | c5.metal Managed Nodegroup | avg 277ms [293,288,253,258,291] | 241ms | avg 3209ms [3077,3091,3871,3082,2923] | ✅ |
+
+### Karpenter 扩容验证 (2026-04-13, ap-northeast-1)
+
+| 指标 | 结果 |
+|------|------|
+| Karpenter 版本 | 1.3.0 (官方镜像) |
+| 实例类型 | c5.metal (96 vCPU, 192 GiB) |
+| EC2 启动 → Node Ready | avg ~44s |
+| Node Ready → kata-deploy 完成 | avg ~2m33s |
+| 端到端 (CreateFleet → Kata Pod 可运行) | avg ~3min |
+| Pause Pod 抢占 → Pool Pod 就绪 | ~3.2s (等同 Cold Start) |
+| 自动扩容 (1→4 节点, 20 replicas BatchSandbox) | ~5 min |
+| Pool 回填 | 10s 内恢复到 bufferMin |
